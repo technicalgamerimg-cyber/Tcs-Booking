@@ -51,3 +51,21 @@ model Order {
 
   @@index([shop])
 }
+
+model TcsSettings {
+  id                  String    @id @default(cuid())
+  shop                String    @unique          // one record per merchant
+  bearerToken         String                     // TCS-issued bearer token
+  username            String                     // TCS username
+  password            String                     // TCS account password
+  accessToken         String?                    // received from TCS auth endpoint
+  accessTokenExpiry   DateTime?                  // "expiry" field from TCS response
+  connectionStatus    String    @default("disconnected") // "connected"|"disconnected"|"error"
+  lastApiMessage      String?                    // "message" field from TCS response
+  lastAuthAttempt     DateTime?                  // timestamp of most recent auth call
+  lastSuccessfulSync  DateTime?                  // set when a booking succeeds
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([shop])
+}
