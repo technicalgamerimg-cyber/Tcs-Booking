@@ -1,0 +1,53 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model Order {
+  id                  String    @id               // Shopify GID
+  shopifyNumericId    String    @unique            // raw numeric ID from webhook
+  shop                String
+  name                String                       // e.g. #1001
+  customerFirstName   String?
+  customerLastName    String?
+  customerPhone       String?
+  totalAmount         String
+  currencyCode        String
+  city                String?
+  financialStatus     String
+  fulfillmentStatus   String?
+  isCancelled         Boolean   @default(false)
+  isBooked            Boolean   @default(false)
+  bookingWeight       String?
+  bookingInstructions String?
+  bookingFreeCod      String?
+  shopifyCreatedAt    DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([shop])
+}
