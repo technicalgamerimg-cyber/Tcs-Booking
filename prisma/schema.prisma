@@ -67,5 +67,36 @@ model TcsSettings {
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
+  costCenterCode       String?
+  tcsAccount           String?
+  defaultInstructions  String?
+
+  @@index([shop])
+}
+
+model TcsCity {
+  id        String   @id @default(cuid())
+  shop      String
+  cityCode  String
+  cityName  String
+  createdAt DateTime @default(now())
+
+  @@unique([shop, cityCode])
+  @@index([shop])
+}
+
+model TcsCostCenter {
+  id             String   @id @default(cuid())
+  shop           String
+  costCenterCode String
+  costCenterName String
+  costCenterCity String
+  phone          String?
+  pickupAddress  String?
+  returnAddress  String?
+  email          String?
+  createdAt      DateTime @default(now())
+
+  @@unique([shop, costCenterCode])
   @@index([shop])
 }

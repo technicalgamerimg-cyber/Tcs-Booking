@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import PropTypes from "prop-types";
-import { useLoaderData, useFetcher, useRouteError } from "react-router";
+import { useLoaderData, useFetcher, useRouteError, useRevalidator } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import {
   Page,
@@ -15,6 +15,7 @@ import {
   Banner,
   Divider,
   Box,
+  Select,
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import {
@@ -22,6 +23,8 @@ import {
   saveTcsCredentials,
   authenticateTcs,
   validateTcsInputs,
+  saveDefaultCostCenter,
+  getTcsCostCenters,
 } from "../utils/tcs.server.js";
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
@@ -31,20 +34,24 @@ export const loader = async ({ request }) => {
   const shop = session.shop;
 
   const status = await getTcsStatus(shop);
+  const costCenters = await getTcsCostCenters(shop);
 
-  // If no record exists, return safe defaults
   if (!status) {
     return {
-      status: null,
+      connectionStatus: null,
       accessTokenExpiry: null,
       lastAuthAttempt: null,
       lastSuccessfulSync: null,
       lastApiMessage: null,
       hasCredentials: false,
+      costCenterCode: "",
+      tcsAccount: "",
+      defaultInstructions: "",
+      costCenters,
     };
   }
 
-  return status;
+  return { ...status, costCenters };
 };
 
 // ─── Action ───────────────────────────────────────────────────────────────────
@@ -61,17 +68,18 @@ export const action = async ({ request }) => {
     const bearerToken = formData.get("bearerToken") ?? "";
     const username = formData.get("username") ?? "";
     const password = formData.get("password") ?? "";
+    const tcsAccount = formData.get("tcsAccount") ?? "";
 
     // 1. Validate inputs — no DB/network calls if fields are invalid
     try {
-      validateTcsInputs({ bearerToken, username, password });
+      validateTcsInputs({ bearerToken, username, password, tcsAccount });
     } catch (err) {
       return { success: false, error: err.message, intent };
     }
 
     // 2. Save credentials to DB
     try {
-      await saveTcsCredentials(shop, { bearerToken, username, password });
+      await saveTcsCredentials(shop, { bearerToken, username, password, tcsAccount });
     } catch (err) {
       return {
         success: false,
@@ -81,18 +89,34 @@ export const action = async ({ request }) => {
     }
 
     // 3. Authenticate with TCS
+    let authResult;
     try {
-      const result = await authenticateTcs(shop);
-      return {
-        success: result.success,
-        message: result.message,
-        error: result.success ? null : `TCS authentication failed: ${result.message}`,
-        intent,
-      };
+      authResult = await authenticateTcs(shop);
     } catch (err) {
+      return { success: false, error: err.message, intent };
+    }
+
+    if (!authResult.success) {
       return {
         success: false,
-        error: err.message,
+        error: `TCS authentication failed: ${authResult.message}`,
+        intent,
+      };
+    }
+
+    // 4. Auto-sync cities and cost centers immediately after successful auth
+    try {
+      const syncResult = await syncTcsData(shop, tcsAccount.trim());
+      return {
+        success: true,
+        message: `Connected. Synced ${syncResult.citiesCount} cities and ${syncResult.costCentersCount} cost centers.`,
+        intent,
+      };
+    } catch (syncErr) {
+      // Auth succeeded — return success even if sync fails
+      return {
+        success: true,
+        message: `Connected. (Data sync failed: ${syncErr.message})`,
         intent,
       };
     }
@@ -108,6 +132,21 @@ export const action = async ({ request }) => {
         error: result.success ? null : `Connection test failed: ${result.message}`,
         intent,
       };
+    } catch (err) {
+      return { success: false, error: err.message, intent };
+    }
+  }
+
+  // ── Save Default Cost Center ─────────────────────────────────────────────
+  if (intent === "save_defaults") {
+    const costCenterCode = formData.get("costCenterCode") ?? "";
+    const defaultInstructions = formData.get("defaultInstructions") ?? "";
+    if (!costCenterCode) {
+      return { success: false, error: "Please select a cost center.", intent };
+    }
+    try {
+      await saveDefaultCostCenter(shop, { costCenterCode, defaultInstructions });
+      return { success: true, message: "Default booking settings saved.", intent };
     } catch (err) {
       return { success: false, error: err.message, intent };
     }
@@ -156,10 +195,15 @@ StatusBadge.propTypes = {
 export default function Settings() {
   const loaderData = useLoaderData();
   const fetcher = useFetcher();
+  const revalidator = useRevalidator();
 
   const [bearerToken, setBearerToken] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [tcsAccount, setTcsAccount] = useState(loaderData.tcsAccount ?? "");
+  const [defaultCostCenterCode, setDefaultCostCenterCode] = useState(loaderData.costCenterCode ?? "");
+  const [defaultInstructions, setDefaultInstructions] = useState(loaderData.defaultInstructions ?? "");
+
   const [banner, setBanner] = useState(null); // { tone, title, message }
 
   const isSubmitting = fetcher.state !== "idle";
@@ -170,26 +214,32 @@ export default function Settings() {
     if (!fetcher.data) return;
 
     if (fetcher.data.success) {
-      const isConnect = fetcher.data.intent === "connect";
-      setBanner({
-        tone: "success",
-        title: isConnect ? "Connected successfully" : "Connection test passed",
-        message: `TCS API responded: ${fetcher.data.message ?? "success"}`,
-      });
-      // Clear form fields after successful connect
-      if (isConnect) {
-        setBearerToken("");
-        setUsername("");
-        setPassword("");
+      revalidator.revalidate();
+
+      if (fetcher.data.intent === "save_defaults") {
+        setBanner({ tone: "success", title: "Saved", message: fetcher.data.message });
+      } else {
+        const isConnect = fetcher.data.intent === "connect";
+        setBanner({
+          tone: "success",
+          title: isConnect ? "Connected successfully" : "Connection test passed",
+          message: fetcher.data.message ?? "success",
+        });
+        if (isConnect) {
+          setBearerToken("");
+          setUsername("");
+          setPassword("");
+        }
       }
     } else if (fetcher.data.error) {
+      revalidator.revalidate();
       setBanner({
         tone: "critical",
-        title: fetcher.data.intent === "connect" ? "Connection failed" : "Test failed",
+        title: fetcher.data.intent === "connect" ? "Connection failed" : "Action failed",
         message: fetcher.data.error,
       });
     }
-  }, [fetcher.data]);
+  }, [fetcher.data]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleConnect = useCallback(() => {
     setBanner(null);
@@ -198,8 +248,9 @@ export default function Settings() {
     formData.append("bearerToken", bearerToken);
     formData.append("username", username);
     formData.append("password", password);
+    formData.append("tcsAccount", tcsAccount);
     fetcher.submit(formData, { method: "POST" });
-  }, [fetcher, bearerToken, username, password]);
+  }, [fetcher, bearerToken, username, password, tcsAccount]);
 
   const handleTest = useCallback(() => {
     setBanner(null);
@@ -208,13 +259,26 @@ export default function Settings() {
     fetcher.submit(formData, { method: "POST" });
   }, [fetcher]);
 
-  // Use fresh loader data if available (re-fetched after action)
-  const currentStatus = loaderData.status;
+  const handleSaveDefaults = useCallback(() => {
+    setBanner(null);
+    const fd = new FormData();
+    fd.append("intent", "save_defaults");
+    fd.append("costCenterCode", defaultCostCenterCode);
+    fd.append("defaultInstructions", defaultInstructions);
+    fetcher.submit(fd, { method: "POST" });
+  }, [fetcher, defaultCostCenterCode, defaultInstructions]);
+
+  const currentStatus = loaderData.connectionStatus;
   const currentExpiry = loaderData.accessTokenExpiry;
   const currentLastAuth = loaderData.lastAuthAttempt;
   const currentLastSync = loaderData.lastSuccessfulSync;
   const currentApiMessage = loaderData.lastApiMessage;
   const hasCredentials = loaderData.hasCredentials;
+
+  const selectedCC = loaderData.costCenters.find(c => c.costCenterCode === defaultCostCenterCode);
+  const costCenterPreview = selectedCC
+    ? [selectedCC.costCenterName, selectedCC.phone, selectedCC.costCenterCity].filter(Boolean).join(" · ")
+    : undefined;
 
   return (
     <Page
@@ -324,24 +388,34 @@ export default function Settings() {
                 placeholder={hasCredentials ? "Leave blank to keep existing token" : ""}
                 helpText="Your TCS-issued API bearer token"
               />
+              <FormLayout.Group>
+                <TextField
+                  id="username-field"
+                  label="Username"
+                  value={username}
+                  onChange={setUsername}
+                  autoComplete="username"
+                  placeholder={hasCredentials ? "Leave blank to keep existing username" : ""}
+                  helpText="Your TCS account username"
+                />
+                <TextField
+                  id="password-field"
+                  label="Password"
+                  type="password"
+                  value={password}
+                  onChange={setPassword}
+                  autoComplete="current-password"
+                  placeholder={hasCredentials ? "Leave blank to keep existing password" : ""}
+                  helpText="Your TCS account password"
+                />
+              </FormLayout.Group>
               <TextField
-                id="username-field"
-                label="Username"
-                value={username}
-                onChange={setUsername}
-                autoComplete="username"
-                placeholder={hasCredentials ? "Leave blank to keep existing username" : ""}
-                helpText="Your TCS account username"
-              />
-              <TextField
-                id="password-field"
-                label="Password"
-                type="password"
-                value={password}
-                onChange={setPassword}
-                autoComplete="current-password"
-                placeholder={hasCredentials ? "Leave blank to keep existing password" : ""}
-                helpText="Your TCS account password"
+                id="tcs-account-field"
+                label="TCS Account Number"
+                value={tcsAccount}
+                onChange={setTcsAccount}
+                autoComplete="off"
+                helpText="e.g. 04011K1. Required to fetch your Cost Centers."
               />
             </FormLayout>
 
@@ -358,6 +432,52 @@ export default function Settings() {
             </InlineStack>
           </BlockStack>
         </Card>
+
+        {/* ── Default Booking Settings Card ──────────────────────────────── */}
+        {hasCredentials && (
+          <Card>
+            <BlockStack gap="400">
+              <Text variant="headingMd" as="h2">
+                Default Booking Settings
+              </Text>
+              <Text tone="subdued" as="p">
+                Select which cost center's details (name, phone, address, city) to use as shipper info on every booking.
+              </Text>
+              <Divider />
+              <Select
+                label="Default Cost Center"
+                options={[
+                  { label: "Select a cost center", value: "" },
+                  ...loaderData.costCenters.map(c => ({
+                    label: `${c.costCenterName} (${c.costCenterCode}) — ${c.costCenterCity}`,
+                    value: c.costCenterCode,
+                  }))
+                ]}
+                value={defaultCostCenterCode}
+                onChange={setDefaultCostCenterCode}
+                helpText={costCenterPreview}
+              />
+              <TextField
+                label="Default Booking Instructions"
+                value={defaultInstructions}
+                onChange={setDefaultInstructions}
+                autoComplete="off"
+                multiline={2}
+                helpText='e.g. "Handle with care" or "Make call before delivery"'
+              />
+              <InlineStack gap="300">
+                <Button
+                  variant="primary"
+                  onClick={handleSaveDefaults}
+                  loading={isSubmitting && pendingIntent === "save_defaults"}
+                  disabled={isSubmitting || !defaultCostCenterCode}
+                >
+                  Save Default
+                </Button>
+              </InlineStack>
+            </BlockStack>
+          </Card>
+        )}
       </BlockStack>
     </Page>
   );

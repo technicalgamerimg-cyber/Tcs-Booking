@@ -5,6 +5,21 @@ const TCS_AUTH_URL =
 const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 minutes before expiry
 const REQUEST_TIMEOUT_MS = 10_000; // 10 seconds
 
+// Normalise ALL-CAPS city/center names from TCS → "Title Case"
+function toTitleCase(str) {
+  return str
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .trim();
+}
+
+// TCS API confirmed field names: isactive ("Y"/"N"), isdeleted ("Y"/"N")
+function isActiveCostCenter(cc) {
+  if (cc.isdeleted === "Y") return false;
+  if (cc.isactive === "N") return false;
+  return true;
+}
+
 // ─── Exported functions ────────────────────────────────────────────────────────
 
 /**
@@ -30,6 +45,9 @@ export async function getTcsStatus(shop) {
       lastAuthAttempt: true,
       lastSuccessfulSync: true,
       lastApiMessage: true,
+      costCenterCode: true,
+      tcsAccount: true,
+      defaultInstructions: true,
     },
   });
 
@@ -42,6 +60,9 @@ export async function getTcsStatus(shop) {
     lastSuccessfulSync: record.lastSuccessfulSync?.toISOString() ?? null,
     lastApiMessage: record.lastApiMessage ?? null,
     hasCredentials: true,
+    costCenterCode: record.costCenterCode ?? "",
+    tcsAccount: record.tcsAccount ?? "",
+    defaultInstructions: record.defaultInstructions ?? "",
   };
 }
 
@@ -51,7 +72,7 @@ export async function getTcsStatus(shop) {
  *
  * @param {{ bearerToken: string, username: string, password: string }} inputs
  */
-export function validateTcsInputs({ bearerToken, username, password }) {
+export function validateTcsInputs({ bearerToken, username, password, tcsAccount }) {
   if (!bearerToken || bearerToken.trim().length < 10) {
     throw new Error("Bearer Token is required and must be at least 10 characters.");
   }
@@ -60,6 +81,9 @@ export function validateTcsInputs({ bearerToken, username, password }) {
   }
   if (!password || password.trim().length < 4) {
     throw new Error("Password is required and must be at least 4 characters.");
+  }
+  if (!tcsAccount || tcsAccount.trim().length < 2) {
+    throw new Error("TCS Account Number is required and must be at least 2 characters.");
   }
 }
 
@@ -70,7 +94,7 @@ export function validateTcsInputs({ bearerToken, username, password }) {
  * @param {string} shop
  * @param {{ bearerToken: string, username: string, password: string }} credentials
  */
-export async function saveTcsCredentials(shop, { bearerToken, username, password }) {
+export async function saveTcsCredentials(shop, { bearerToken, username, password, tcsAccount }) {
   if (!bearerToken || !username || !password) {
     throw new Error("All credential fields (bearerToken, username, password) are required.");
   }
@@ -82,12 +106,14 @@ export async function saveTcsCredentials(shop, { bearerToken, username, password
       bearerToken: bearerToken.trim(),
       username: username.trim(),
       password: password.trim(),
+      tcsAccount: tcsAccount ? tcsAccount.trim() : "",
       connectionStatus: "disconnected",
     },
     update: {
       bearerToken: bearerToken.trim(),
       username: username.trim(),
       password: password.trim(),
+      tcsAccount: tcsAccount ? tcsAccount.trim() : undefined,
       connectionStatus: "disconnected",
       // Clear any stale auth state when credentials change
       accessToken: null,
@@ -95,6 +121,145 @@ export async function saveTcsCredentials(shop, { bearerToken, username, password
       lastApiMessage: null,
     },
   });
+}
+
+export async function saveDefaultCostCenter(shop, { costCenterCode, defaultInstructions }) {
+  await db.tcsSettings.update({
+    where: { shop },
+    data: {
+      costCenterCode: costCenterCode.trim(),
+      defaultInstructions: defaultInstructions.trim(),
+    },
+  });
+}
+
+export async function getDefaultCostCenterDetails(shop) {
+  const settings = await db.tcsSettings.findUnique({
+    where: { shop },
+    select: { costCenterCode: true },
+  });
+  if (!settings?.costCenterCode) return null;
+
+  return db.tcsCostCenter.findUnique({
+    where: { shop_costCenterCode: { shop, costCenterCode: settings.costCenterCode } },
+  });
+}
+
+export async function getTcsCities(shop) {
+  const rows = await db.tcsCity.findMany({
+    where: { shop },
+    orderBy: { cityName: "asc" },
+  });
+  return rows.map((c) => ({ ...c, cityName: toTitleCase(c.cityName) }));
+}
+
+export async function getTcsCostCenters(shop) {
+  return db.tcsCostCenter.findMany({
+    where: { shop },
+    orderBy: { costCenterName: "asc" },
+  });
+}
+
+/**
+ * Fetches Cities and Cost Centers from the TCS API and saves them to the DB.
+ */
+export async function syncTcsData(shop, tcsAccount) {
+  if (!tcsAccount) {
+    throw new Error("TCS Account Number is required to fetch Cost Centers.");
+  }
+
+  // TCS two-token pattern:
+  //   Authorization header → static bearerToken (API key)
+  //   accesstoken query param → dynamic accessToken (session token)
+  const [accessToken, settings] = await Promise.all([
+    ensureValidTcsToken(shop),
+    db.tcsSettings.findUnique({ where: { shop }, select: { bearerToken: true } }),
+  ]);
+
+  if (!settings?.bearerToken) {
+    throw new Error("No TCS credentials found. Please reconnect.");
+  }
+
+  const { bearerToken } = settings;
+
+  // 1. Fetch Cities
+  const citiesRes = await fetch(
+    `https://ociconnect.tcscourier.com/ecom/api/setup/citylistbycountry?countrycode=Pk&accesstoken=${encodeURIComponent(accessToken)}`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${bearerToken}`, Accept: "application/json" },
+    },
+  );
+
+  if (!citiesRes.ok) throw new Error(`Failed to fetch cities: ${citiesRes.statusText}`);
+  const citiesData = await citiesRes.json();
+  let citiesCount = 0;
+
+  if (citiesData.message === "SUCCESS" && Array.isArray(citiesData.data)) {
+    const uniqueCities = Array.from(
+      new Map(
+        citiesData.data
+          .filter((c) => c.citycode && c.cityname)
+          .map((c) => [
+            c.citycode,
+            { shop, cityCode: c.citycode, cityName: toTitleCase(c.cityname) },
+          ]),
+      ).values(),
+    );
+
+    // Transaction: delete + insert are atomic — partial state impossible
+    await db.$transaction(async (tx) => {
+      await tx.tcsCity.deleteMany({ where: { shop } });
+      // SQLite has a variable limit; insert in chunks of 500
+      for (let i = 0; i < uniqueCities.length; i += 500) {
+        await tx.tcsCity.createMany({ data: uniqueCities.slice(i, i + 500) });
+      }
+    });
+    citiesCount = uniqueCities.length;
+  }
+
+  // 2. Fetch Cost Centers
+  const ccRes = await fetch(
+    `https://ociconnect.tcscourier.com/ecom/api/inquiry/costcenterinquiry?accesstoken=${encodeURIComponent(accessToken)}&customerno=${encodeURIComponent(tcsAccount)}`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${bearerToken}`, Accept: "application/json" },
+    },
+  );
+
+  if (!ccRes.ok) throw new Error(`Failed to fetch cost centers: ${ccRes.statusText}`);
+  const ccData = await ccRes.json();
+  let costCentersCount = 0;
+
+  if (Array.isArray(ccData.detail)) {
+    const uniqueCCs = Array.from(
+      new Map(
+        ccData.detail
+          .filter((cc) => cc.costcentercode && isActiveCostCenter(cc))
+          .map((cc) => [
+            cc.costcentercode,
+            {
+              shop,
+              costCenterCode: cc.costcentercode,
+              costCenterName: cc.costcentername ?? "Unnamed",
+              costCenterCity: toTitleCase(cc.costcentercity ?? ""),
+              phone: cc.phoneno ?? "",
+              pickupAddress: cc.pickupaddress ?? "",
+              returnAddress: cc.returnaddress ?? "",
+              email: cc.email ?? "",
+            },
+          ]),
+      ).values(),
+    );
+
+    await db.$transaction(async (tx) => {
+      await tx.tcsCostCenter.deleteMany({ where: { shop } });
+      await tx.tcsCostCenter.createMany({ data: uniqueCCs });
+    });
+    costCentersCount = uniqueCCs.length;
+  }
+
+  return { success: true, citiesCount, costCentersCount };
 }
 
 /**

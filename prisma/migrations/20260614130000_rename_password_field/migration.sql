@@ -1,2 +1,2 @@
--- RenameColumn
-ALTER TABLE "TcsSettings" RENAME COLUMN "passwordEncrypted" TO "password";
+-- This migration is intentionally empty to resolve a shadow DB conflict.
+-- The column rename was already handled in 20260614121903.
