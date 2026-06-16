@@ -45,6 +45,12 @@ model Order {
   bookingWeight       String?
   bookingInstructions String?
   bookingFreeCod      String?
+  tcsConsignmentNo    String?
+  shippingAddress1    String?
+  productSummary      String?
+  bookedAt            DateTime?
+  shopifyFulfillmentId String?
+  shipmentStatus      String    @default("BOOKED")
   shopifyCreatedAt    DateTime?
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
@@ -70,8 +76,22 @@ model TcsSettings {
   costCenterCode       String?
   tcsAccount           String?
   defaultInstructions  String?
+  storeLogo            String?
 
   @@index([shop])
+}
+
+model LoadsheetHistory {
+  id              String   @id @default(cuid())
+  shop            String
+  generatedAt     DateTime @default(now())
+  label           String   @default("")
+  shipmentCount   Int      @default(0)
+  totalCod        Float    @default(0)
+  totalWeight     Float    @default(0)
+  ordersSnapshot  String   @default("[]") // JSON of minimal row data for PDF re-generation
+
+  @@index([shop, generatedAt])
 }
 
 model TcsCity {

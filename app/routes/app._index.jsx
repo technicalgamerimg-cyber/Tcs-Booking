@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
-import { useLoaderData, useFetcher, useRouteError } from "react-router";
+import { useLoaderData, useFetcher, useRouteError, useRevalidator } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import {
@@ -17,11 +17,14 @@ import {
   Modal,
   FormLayout,
   Banner,
+  List,
   Pagination,
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import { normalizePaymentStatus } from "../utils/orderStatus";
+import { bookTcsShipment, bookTcsShipmentBulk, runInBatches } from "../utils/tcs.server.js";
+import { fulfillShopifyOrder } from "../utils/shopify.server.js";
 
 const PAGE_SIZE = 50;
 
@@ -35,10 +38,15 @@ const FETCH_ORDERS_QUERY = `#graphql
           name
           customer { firstName lastName phone }
           totalPriceSet { shopMoney { amount currencyCode } }
-          shippingAddress { city }
+          shippingAddress { city address1 }
           displayFinancialStatus
           displayFulfillmentStatus
           createdAt
+          lineItems(first: 10) {
+            edges {
+              node { title sku quantity }
+            }
+          }
         }
       }
       pageInfo { hasNextPage endCursor }
@@ -72,6 +80,17 @@ export const loader = async ({ request }) => {
 
     for (const { node } of edges) {
       const numericId = node.id.replace("gid://shopify/Order/", "");
+      const lineItems = node.lineItems?.edges?.map((e) => e.node) ?? [];
+      const productSummary = lineItems.length
+        ? lineItems
+            .map((item) => {
+              const sku = item.sku ? `[${item.sku}] ` : "";
+              return `${sku}${item.title} x${item.quantity}`;
+            })
+            .join(", ")
+            .slice(0, 500)
+        : null;
+
       await db.order.upsert({
         where: { shopifyNumericId: numericId },
         create: {
@@ -85,9 +104,11 @@ export const loader = async ({ request }) => {
           totalAmount: node.totalPriceSet?.shopMoney?.amount ?? "0",
           currencyCode: node.totalPriceSet?.shopMoney?.currencyCode ?? "",
           city: node.shippingAddress?.city ?? null,
+          shippingAddress1: node.shippingAddress?.address1 ?? null,
           financialStatus: normalizePaymentStatus(node.displayFinancialStatus),
           fulfillmentStatus: node.displayFulfillmentStatus ?? null,
           shopifyCreatedAt: node.createdAt ? new Date(node.createdAt) : null,
+          productSummary,
           ...(node.displayFulfillmentStatus?.toUpperCase() === "FULFILLED"
             ? { isBooked: true }
             : {}),
@@ -100,8 +121,10 @@ export const loader = async ({ request }) => {
           totalAmount: node.totalPriceSet?.shopMoney?.amount ?? "0",
           currencyCode: node.totalPriceSet?.shopMoney?.currencyCode ?? "",
           city: node.shippingAddress?.city ?? null,
+          shippingAddress1: node.shippingAddress?.address1 ?? null,
           financialStatus: normalizePaymentStatus(node.displayFinancialStatus),
           fulfillmentStatus: node.displayFulfillmentStatus ?? null,
+          productSummary,
           ...(node.displayFulfillmentStatus?.toUpperCase() === "FULFILLED"
             ? { isBooked: true }
             : {}),
@@ -128,48 +151,156 @@ export const loader = async ({ request }) => {
     db.order.count({ where: { shop, isCancelled: false } }),
   ]);
 
-  return { orders, total, page, hasMore: skip + orders.length < total, syncError };
+  return {
+    orders,
+    total,
+    page,
+    hasMore: skip + orders.length < total,
+    syncError,
+  };
 };
 
 // ─── Action: book an order ────────────────────────────────────────────────────
 
 export const action = async ({ request }) => {
-  await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
   const formData = await request.formData();
 
+  // ── Bulk booking ─────────────────────────────────────────────────────────
   if (formData.get("_action") === "bulk") {
     const orderIds = formData.getAll("orderIds");
     if (!orderIds.length) return { success: false, error: "No orders selected." };
 
-    try {
-      const result = await db.order.updateMany({
-        where: { id: { in: orderIds }, isBooked: false },
-        data: { isBooked: true },
-      });
-      return { success: true, bulk: true, count: result.count };
-    } catch (err) {
-      console.error("Bulk booking failed:", err.message);
-      return { success: false, error: `Bulk booking failed: ${err.message}` };
-    }
-  }
-
-  const orderId = formData.get("orderId");
-  if (!orderId) return { success: false, error: "Order ID is required." };
-
-  try {
-    await db.order.update({
-      where: { id: orderId },
-      data: {
-        isBooked: true,
-        bookingWeight: formData.get("weight") || null,
-        bookingInstructions: formData.get("instructions") || null,
-        bookingFreeCod: formData.get("freeCod") || null,
+    const orders = await db.order.findMany({
+      where: { id: { in: orderIds }, shop, isBooked: false },
+      select: {
+        id: true, shopifyNumericId: true, name: true,
+        customerFirstName: true, customerLastName: true,
+        customerPhone: true, city: true, shippingAddress1: true,
+        financialStatus: true, totalAmount: true,
       },
     });
-    return { success: true, orderId };
+
+    // Stage 1: book all CNs with TCS (batches of 5)
+    const tcsResults = await bookTcsShipmentBulk(shop, orders);
+
+    const booked = tcsResults.filter((r) => r.status === "fulfilled").length;
+    const failed = tcsResults
+      .map((r, i) =>
+        r.status === "rejected"
+          ? { name: orders[i].name, reason: r.reason.message }
+          : null,
+      )
+      .filter(Boolean);
+
+    // Stage 2: Shopify fulfillment write-back for successfully booked orders (batches of 3)
+    const bookedPairs = tcsResults
+      .map((r, i) =>
+        r.status === "fulfilled"
+          ? { order: orders[i], consignmentNo: r.value.consignmentNo }
+          : null,
+      )
+      .filter(Boolean);
+
+    await runInBatches(bookedPairs, 3, async ({ order, consignmentNo }) => {
+      const fb = await fulfillShopifyOrder(admin, order, consignmentNo);
+      if (fb.fulfillmentId) {
+        await db.order
+          .update({ where: { id: order.id }, data: { shopifyFulfillmentId: fb.fulfillmentId } })
+          .catch((err) => console.error("[Bulk] fulfillmentId save failed:", err.message));
+      } else if (fb.error) {
+        console.warn(`[Bulk] Shopify fulfillment failed for ${order.name}:`, fb.error);
+      }
+    });
+
+    return { success: true, bulk: true, booked, failed, intent: "bulk" };
+  }
+
+  // ── Reset booked order (cancelled externally at TCS portal) ─────────────
+  if (formData.get("_action") === "reset") {
+    const orderId = formData.get("orderId");
+    await db.order.update({
+      where: { id: orderId, shop },
+      data: { isBooked: false, shipmentStatus: "CANCELLED" },
+    });
+    return { success: true, intent: "reset" };
+  }
+
+  // ── Single booking ───────────────────────────────────────────────────────
+  const orderId = formData.get("orderId");
+  if (!orderId) return { success: false, error: "Order ID is required.", intent: "book" };
+
+  const order = await db.order.findFirst({
+    where: { id: orderId, shop },
+    select: {
+      id: true, shopifyNumericId: true, name: true,
+      customerFirstName: true, customerLastName: true,
+      customerPhone: true, city: true, shippingAddress1: true,
+      financialStatus: true, totalAmount: true, isBooked: true,
+      productSummary: true,
+    },
+  });
+
+  if (!order) return { success: false, error: "Order not found.", intent: "book" };
+  if (order.isBooked) return { success: false, error: "Order already booked.", intent: "book" };
+
+  try {
+    const { consignmentNo, remarks } = await bookTcsShipment(shop, order, {
+      bookingWeight: formData.get("weight"),
+      bookingInstructions: formData.get("instructions"),
+      bookingFreeCod: formData.get("freeCod"),
+    });
+
+    // Shopify fulfillment write-back (non-blocking — booking still succeeds if this fails)
+    let shopifyFulfillmentId = null;
+    let fulfillmentError = null;
+    try {
+      const fb = await fulfillShopifyOrder(admin, order, consignmentNo);
+      shopifyFulfillmentId = fb.fulfillmentId;
+      if (fb.error) {
+        fulfillmentError = fb.error;
+        console.warn("[Shopify] Fulfillment write-back failed:", fb.error);
+      }
+    } catch (fbErr) {
+      fulfillmentError = fbErr.message;
+      console.error("[Shopify] Fulfillment write-back threw:", fbErr.message);
+    }
+
+    if (shopifyFulfillmentId) {
+      await db.order
+        .update({ where: { id: order.id }, data: { shopifyFulfillmentId } })
+        .catch((err) => console.error("[DB] fulfillmentId save failed:", err.message));
+    }
+
+    const weightKg = Math.max(parseFloat(formData.get("weight")) || 0.5, 0.5);
+    const isPaid   = order.financialStatus?.toLowerCase() === "paid";
+    const cod      = isPaid ? 0 : (parseInt(formData.get("freeCod") || order.totalAmount, 10) || 0);
+    return {
+      success: true,
+      intent: "book",
+      consignmentNo,
+      fulfillmentError,
+      bookedOrder: {
+        id:                  order.id,
+        name:                order.name,
+        shopifyNumericId:    order.shopifyNumericId,
+        customerFirstName:   order.customerFirstName,
+        customerLastName:    order.customerLastName,
+        customerPhone:       order.customerPhone,
+        city:                order.city,
+        shippingAddress1:    order.shippingAddress1,
+        financialStatus:     order.financialStatus,
+        tcsConsignmentNo:    consignmentNo,
+        bookingWeight:       String(weightKg),
+        bookingFreeCod:      String(cod),
+        bookingInstructions: remarks || null,
+        productSummary:      order.productSummary || null,
+      },
+    };
   } catch (err) {
-    console.error("Booking failed:", err.message);
-    return { success: false, error: `Booking failed: ${err.message}` };
+    console.error("Single booking failed:", err.message);
+    return { success: false, error: err.message, intent: "book" };
   }
 };
 
@@ -179,6 +310,7 @@ export default function Orders() {
   const { orders, total, page, hasMore, syncError } = useLoaderData();
   const fetcher = useFetcher();
   const shopify = useAppBridge();
+  const revalidator = useRevalidator();
 
   const [search, setSearch] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
@@ -186,6 +318,10 @@ export default function Orders() {
   const [weight, setWeight] = useState("");
   const [instructions, setInstructions] = useState("");
   const [freeCod, setFreeCod] = useState("");
+
+  // Booking result banners
+  const [bookingResult, setBookingResult] = useState(null); // full bookedOrder object
+  const [bulkResult, setBulkResult] = useState(null);       // { booked, failed[] }
 
   const isBooking = fetcher.state !== "idle";
 
@@ -283,22 +419,34 @@ export default function Orders() {
   }, [selectedOrder, weight, instructions, freeCod, fetcher]);
 
   useEffect(() => {
-    if (!fetcher.data) return;
-    if (fetcher.data.success) {
-      if (fetcher.data.bulk) {
+    const data = fetcher.data;
+    if (!data) return;
+
+    if (data.success) {
+      revalidator.revalidate();
+
+      if (data.intent === "bulk") {
         setSelectedResources([]);
-        shopify.toast.show(
-          `${fetcher.data.count} order${fetcher.data.count !== 1 ? "s" : ""} booked successfully`,
-        );
+        setBulkResult({ booked: data.booked, failed: data.failed ?? [] });
+      } else if (data.intent === "reset") {
+        shopify.toast.show("Order reset — ready to re-book.");
       } else {
+        // Single booking
         closeModal();
-        shopify.toast.show("Order booked successfully");
+        setBookingResult(data.bookedOrder ?? null);
+        if (data.fulfillmentError) {
+          shopify.toast.show(
+            `CN ${data.consignmentNo} booked — Shopify fulfillment failed: ${data.fulfillmentError}`,
+            { isError: true },
+          );
+        }
       }
     }
-    if (fetcher.data.error) {
-      shopify.toast.show(fetcher.data.error, { isError: true });
+
+    if (!data.success && data.error) {
+      shopify.toast.show(data.error, { isError: true });
     }
-  }, [fetcher.data, closeModal, shopify]);
+  }, [fetcher.data]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const rowMarkup = filtered.map((order, index) => {
     const isPaid = order.financialStatus === "paid";
@@ -378,6 +526,41 @@ export default function Orders() {
         {syncError && (
           <Banner tone="critical" title="Sync error">
             <p>{syncError}</p>
+          </Banner>
+        )}
+
+        {/* Single booking result */}
+        {bookingResult && (
+          <Banner
+            tone="success"
+            title={`Booked — CN: ${bookingResult.tcsConsignmentNo}`}
+            onDismiss={() => setBookingResult(null)}
+          >
+            <Button
+              variant="plain"
+              onClick={() => openLabelForOrder(bookingResult)}
+            >
+              Open Label (PDF)
+            </Button>
+          </Banner>
+        )}
+
+        {/* Bulk booking result */}
+        {bulkResult && (
+          <Banner
+            tone={bulkResult.failed.length ? "warning" : "success"}
+            title={`Bulk booking: ${bulkResult.booked} booked${bulkResult.failed.length ? `, ${bulkResult.failed.length} failed` : ""}`}
+            onDismiss={() => setBulkResult(null)}
+          >
+            {bulkResult.failed.length > 0 && (
+              <List>
+                {bulkResult.failed.map((f) => (
+                  <List.Item key={f.name}>
+                    {f.name} — {f.reason}
+                  </List.Item>
+                ))}
+              </List>
+            )}
           </Banner>
         )}
 

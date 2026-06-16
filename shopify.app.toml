@@ -7,7 +7,7 @@ name = "TCS BOOKING"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,read_customers"
+scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,write_orders,read_customers,read_fulfillments,write_fulfillments,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_locations"
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"

@@ -48,6 +48,7 @@ export async function getTcsStatus(shop) {
       costCenterCode: true,
       tcsAccount: true,
       defaultInstructions: true,
+      storeLogo: true,
     },
   });
 
@@ -63,7 +64,15 @@ export async function getTcsStatus(shop) {
     costCenterCode: record.costCenterCode ?? "",
     tcsAccount: record.tcsAccount ?? "",
     defaultInstructions: record.defaultInstructions ?? "",
+    storeLogo: record.storeLogo ?? null,
   };
+}
+
+export async function saveStoreLogo(shop, base64DataUrl) {
+  await db.tcsSettings.update({
+    where: { shop },
+    data: { storeLogo: base64DataUrl },
+  });
 }
 
 /**
@@ -123,7 +132,7 @@ export async function saveTcsCredentials(shop, { bearerToken, username, password
   });
 }
 
-export async function saveDefaultCostCenter(shop, { costCenterCode, defaultInstructions }) {
+export async function saveDefaultCostCenter(shop, { costCenterCode, defaultInstructions, shipperPhone, shipperAddress }) {
   await db.tcsSettings.update({
     where: { shop },
     data: {
@@ -131,6 +140,16 @@ export async function saveDefaultCostCenter(shop, { costCenterCode, defaultInstr
       defaultInstructions: defaultInstructions.trim(),
     },
   });
+
+  if (costCenterCode.trim()) {
+    await db.tcsCostCenter.update({
+      where: { shop_costCenterCode: { shop, costCenterCode: costCenterCode.trim() } },
+      data: {
+        phone:         shipperPhone?.trim()   ?? "",
+        pickupAddress: shipperAddress?.trim() ?? "",
+      },
+    });
+  }
 }
 
 export async function getDefaultCostCenterDetails(shop) {
@@ -143,6 +162,231 @@ export async function getDefaultCostCenterDetails(shop) {
   return db.tcsCostCenter.findUnique({
     where: { shop_costCenterCode: { shop, costCenterCode: settings.costCenterCode } },
   });
+}
+
+// ─── Batch helper ─────────────────────────────────────────────────────────────
+
+export async function runInBatches(items, batchSize, fn) {
+  const results = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const batchResults = await Promise.allSettled(batch.map(fn));
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+// ─── TCS Booking ──────────────────────────────────────────────────────────────
+
+/**
+ * Books a single shipment with TCS. Runs pre-flight validation, calls the
+ * Booking Create API, then persists the returned consignment number.
+ *
+ * @param {string} shop
+ * @param {object} order  - full order row from DB (id, shopifyNumericId, name,
+ *   customerFirstName, customerLastName, customerPhone, city, shippingAddress1,
+ *   financialStatus, totalAmount)
+ * @param {{ bookingWeight?: string, bookingInstructions?: string, bookingFreeCod?: string }} opts
+ * @returns {Promise<{ consignmentNo: string }>}
+ */
+export async function bookTcsShipment(shop, order, { bookingWeight, bookingInstructions, bookingFreeCod } = {}) {
+  const [accessToken, settings, costCenter] = await Promise.all([
+    ensureValidTcsToken(shop),
+    db.tcsSettings.findUnique({
+      where: { shop },
+      select: { bearerToken: true, tcsAccount: true, costCenterCode: true, defaultInstructions: true },
+    }),
+    getDefaultCostCenterDetails(shop),
+  ]);
+
+  // ── Pre-flight checks ─────────────────────────────────────────────────────
+  if (!settings?.tcsAccount) throw new Error("TCS account not configured. Go to Settings.");
+  if (!settings?.costCenterCode) throw new Error("Default cost center not selected. Go to Settings.");
+  if (!costCenter) throw new Error("Default cost center details not found. Re-sync in Settings.");
+  if (!order.customerPhone) throw new Error(`Order ${order.name} has no customer phone. Cannot book.`);
+  if (!order.city) throw new Error(`Order ${order.name} has no city. Cannot book.`);
+
+  const weightKg = Math.max(parseFloat(bookingWeight) || 0.5, 0.5);
+  const isPaid = order.financialStatus?.toLowerCase() === "paid";
+  const codAmount = isPaid ? 0 : (parseInt(bookingFreeCod || order.totalAmount, 10) || 0);
+  const remarks = [bookingInstructions, settings.defaultInstructions]
+    .filter(Boolean).join(" | ").slice(0, 500);
+
+  const payload = {
+    accesstoken: accessToken,
+    shipperinfo: {
+      tcsaccount: settings.tcsAccount,
+      shippername: costCenter.costCenterName,
+      address1: costCenter.pickupAddress || costCenter.costCenterCity,
+      countrycode: "PK",
+      countryname: "Pakistan",
+      cityname: costCenter.costCenterCity,
+      mobile: costCenter.phone || "03000000000",
+    },
+    consigneeinfo: {
+      firstname: order.customerFirstName || "Customer",
+      middlename: order.customerLastName || " ",
+      address1: order.shippingAddress1 || order.city,
+      countrycode: "PK",
+      countryname: "Pakistan",
+      cityname: order.city,
+      mobile: order.customerPhone,
+    },
+    shipmentinfo: {
+      costcentercode: settings.costCenterCode,
+      servicecode: "O",
+      currency: "PKR",
+      codamount: codAmount,
+      weightinkg: weightKg,
+      pieces: 1,
+      fragile: false,
+      ...(remarks ? { remarks } : {}),
+    },
+  };
+
+  const res = await fetch("https://ociconnect.tcscourier.com/ecom/api/booking/create", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${settings.bearerToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const body = await res.json().catch(() => ({}));
+
+  // Defensive: try all known response field names from TCS
+  const consignmentNo =
+    body.consignmentNo ||
+    body.data?.consignmentNo ||
+    body.data?.consignmentnumber ||
+    body.consignmentnumber ||
+    null;
+
+  if (!res.ok || body.status === false || !consignmentNo) {
+    throw new Error(body.message || body.data?.message || `TCS booking failed (HTTP ${res.status})`);
+  }
+
+  // Separate try/catch: TCS shipment was created — log CN if DB write fails
+  try {
+    await db.order.update({
+      where: { id: order.id },
+      data: {
+        isBooked: true,
+        tcsConsignmentNo: consignmentNo,
+        bookingWeight: String(weightKg),
+        bookingInstructions: remarks || null,
+        bookingFreeCod: String(codAmount),
+        bookedAt: new Date(),
+        shipmentStatus: 'BOOKED',
+      },
+    });
+  } catch (dbErr) {
+    console.error(`[TCS] DB update failed after booking. CN: ${consignmentNo} | Order: ${order.name}`, dbErr.message);
+  }
+
+  return { consignmentNo, remarks };
+}
+
+// ─── TCS Label ────────────────────────────────────────────────────────────────
+
+/**
+ * Fetches a shipment label from TCS. Returns either raw PDF buffer or a
+ * redirect URL depending on what TCS actually returns.
+ *
+ * @param {string} shop
+ * @param {string} consignmentNo
+ * @returns {Promise<{ type: "buffer", data: ArrayBuffer } | { type: "url", url: string }>}
+ */
+export async function getTcsLabel(shop, consignmentNo) {
+  const [accessToken, settings] = await Promise.all([
+    ensureValidTcsToken(shop),
+    db.tcsSettings.findUnique({ where: { shop }, select: { bearerToken: true } }),
+  ]);
+
+  const url = new URL("https://ociconnect.tcscourier.com/ecom/api/print/label");
+  url.searchParams.set("accesstoken", accessToken);
+  url.searchParams.set("consignmentno", consignmentNo);
+  url.searchParams.set("shipperDetails", "true");
+  url.searchParams.set("printtype", "1");
+  url.searchParams.set("accounttype", "1");
+
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${settings.bearerToken}` },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Label fetch failed: ${res.status} ${res.statusText}`);
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+
+  // Case 1: raw PDF bytes
+  if (contentType.includes("application/pdf") || contentType.includes("octet-stream")) {
+    return { type: "buffer", data: await res.arrayBuffer() };
+  }
+
+  // Case 2: JSON response — may contain base64 or a URL
+  const json = await res.json().catch(() => null);
+  if (json) {
+    const b64 = json.file || json.filedata || json.pdf || json.content || json.data;
+    if (typeof b64 === "string") {
+      const binary = Buffer.from(b64, "base64");
+      return { type: "buffer", data: binary.buffer };
+    }
+    const labelUrl = json.url || json.labelUrl;
+    if (labelUrl) {
+      return { type: "url", url: labelUrl };
+    }
+  }
+
+  throw new Error("TCS label endpoint returned an unrecognised format.");
+}
+
+/**
+ * Books multiple orders in batches of 5 concurrent requests.
+ * Returns allSettled-style results so one failure doesn't block the rest.
+ *
+ * @param {string} shop
+ * @param {object[]} orders
+ * @returns {Promise<PromiseSettledResult[]>}
+ */
+export async function bookTcsShipmentBulk(shop, orders) {
+  return runInBatches(orders, 5, (order) => bookTcsShipment(shop, order, {}));
+}
+
+/**
+ * Cancels a booked TCS shipment.
+ * Endpoint: POST /ecom/api/booking/cancel
+ *
+ * @param {string} shop
+ * @param {string} consignmentNo
+ * @returns {Promise<{ success: true }>}
+ */
+export async function cancelTcsShipment(shop, consignmentNo) {
+  const [accessToken, settings] = await Promise.all([
+    ensureValidTcsToken(shop),
+    db.tcsSettings.findUnique({ where: { shop }, select: { bearerToken: true } }),
+  ]);
+
+  const res = await fetch('https://ociconnect.tcscourier.com/ecom/api/booking/cancel', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${settings.bearerToken}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ consignmentNumber: consignmentNo, accesstoken: accessToken }),
+  });
+
+  const body = await res.json().catch(() => ({}));
+
+  if (!res.ok || body.message?.toUpperCase() !== 'SUCCESS') {
+    throw new Error(body.message || `TCS cancel failed (HTTP ${res.status})`);
+  }
+
+  return { success: true };
 }
 
 export async function getTcsCities(shop) {

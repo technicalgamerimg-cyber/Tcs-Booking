@@ -25,6 +25,8 @@ import {
   validateTcsInputs,
   saveDefaultCostCenter,
   getTcsCostCenters,
+  syncTcsData,
+  saveStoreLogo,
 } from "../utils/tcs.server.js";
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
@@ -141,12 +143,38 @@ export const action = async ({ request }) => {
   if (intent === "save_defaults") {
     const costCenterCode = formData.get("costCenterCode") ?? "";
     const defaultInstructions = formData.get("defaultInstructions") ?? "";
+    const shipperPhone = formData.get("shipperPhone") ?? "";
+    const shipperAddress = formData.get("shipperAddress") ?? "";
     if (!costCenterCode) {
       return { success: false, error: "Please select a cost center.", intent };
     }
     try {
-      await saveDefaultCostCenter(shop, { costCenterCode, defaultInstructions });
+      await saveDefaultCostCenter(shop, { costCenterCode, defaultInstructions, shipperPhone, shipperAddress });
       return { success: true, message: "Default booking settings saved.", intent };
+    } catch (err) {
+      return { success: false, error: err.message, intent };
+    }
+  }
+
+  // ── Save Store Logo ──────────────────────────────────────────────────────
+  if (intent === "save_logo") {
+    const logoData = formData.get("logoData") ?? "";
+    if (!logoData.startsWith("data:image/")) {
+      return { success: false, error: "Invalid image format.", intent };
+    }
+    try {
+      await saveStoreLogo(shop, logoData);
+      return { success: true, message: "Store logo saved.", intent };
+    } catch (err) {
+      return { success: false, error: err.message, intent };
+    }
+  }
+
+  // ── Remove Store Logo ────────────────────────────────────────────────────
+  if (intent === "remove_logo") {
+    try {
+      await saveStoreLogo(shop, null);
+      return { success: true, message: "Store logo removed.", intent };
     } catch (err) {
       return { success: false, error: err.message, intent };
     }
@@ -204,7 +232,20 @@ export default function Settings() {
   const [defaultCostCenterCode, setDefaultCostCenterCode] = useState(loaderData.costCenterCode ?? "");
   const [defaultInstructions, setDefaultInstructions] = useState(loaderData.defaultInstructions ?? "");
 
-  const [banner, setBanner] = useState(null); // { tone, title, message }
+  const initialCC = loaderData.costCenters.find(c => c.costCenterCode === (loaderData.costCenterCode ?? ""));
+  const [shipperPhone, setShipperPhone] = useState(initialCC?.phone ?? "");
+  const [shipperAddress, setShipperAddress] = useState(initialCC?.pickupAddress ?? "");
+
+  const [logoPreview, setLogoPreview] = useState(loaderData.storeLogo ?? null);
+
+  const [banner, setBanner] = useState(null);
+
+  // Sync shipper fields when cost center selection changes
+  useEffect(() => {
+    const cc = loaderData.costCenters.find(c => c.costCenterCode === defaultCostCenterCode);
+    setShipperPhone(cc?.phone ?? "");
+    setShipperAddress(cc?.pickupAddress ?? "");
+  }, [defaultCostCenterCode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const isSubmitting = fetcher.state !== "idle";
   const pendingIntent = fetcher.formData?.get("intent");
@@ -216,10 +257,11 @@ export default function Settings() {
     if (fetcher.data.success) {
       revalidator.revalidate();
 
-      if (fetcher.data.intent === "save_defaults") {
+      const intent = fetcher.data.intent;
+      if (intent === "save_defaults" || intent === "save_logo" || intent === "remove_logo") {
         setBanner({ tone: "success", title: "Saved", message: fetcher.data.message });
       } else {
-        const isConnect = fetcher.data.intent === "connect";
+        const isConnect = intent === "connect";
         setBanner({
           tone: "success",
           title: isConnect ? "Connected successfully" : "Connection test passed",
@@ -259,14 +301,41 @@ export default function Settings() {
     fetcher.submit(formData, { method: "POST" });
   }, [fetcher]);
 
+  const handleLogoFile = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => setLogoPreview(ev.target.result);
+    reader.readAsDataURL(file);
+  }, []);
+
+  const handleSaveLogo = useCallback(() => {
+    if (!logoPreview) return;
+    setBanner(null);
+    const fd = new FormData();
+    fd.append("intent", "save_logo");
+    fd.append("logoData", logoPreview);
+    fetcher.submit(fd, { method: "POST" });
+  }, [fetcher, logoPreview]);
+
+  const handleRemoveLogo = useCallback(() => {
+    setBanner(null);
+    setLogoPreview(null);
+    const fd = new FormData();
+    fd.append("intent", "remove_logo");
+    fetcher.submit(fd, { method: "POST" });
+  }, [fetcher]);
+
   const handleSaveDefaults = useCallback(() => {
     setBanner(null);
     const fd = new FormData();
     fd.append("intent", "save_defaults");
     fd.append("costCenterCode", defaultCostCenterCode);
     fd.append("defaultInstructions", defaultInstructions);
+    fd.append("shipperPhone", shipperPhone);
+    fd.append("shipperAddress", shipperAddress);
     fetcher.submit(fd, { method: "POST" });
-  }, [fetcher, defaultCostCenterCode, defaultInstructions]);
+  }, [fetcher, defaultCostCenterCode, defaultInstructions, shipperPhone, shipperAddress]);
 
   const currentStatus = loaderData.connectionStatus;
   const currentExpiry = loaderData.accessTokenExpiry;
@@ -433,6 +502,67 @@ export default function Settings() {
           </BlockStack>
         </Card>
 
+        {/* ── Store Logo Card ────────────────────────────────────────────── */}
+        {hasCredentials && (
+          <Card>
+            <BlockStack gap="400">
+              <Text variant="headingMd" as="h2">Store Logo</Text>
+              <Text tone="subdued" as="p">
+                Upload your store logo to display it on shipping labels. Recommended: PNG with transparent background, at least 200×80 px.
+              </Text>
+              <Divider />
+              {logoPreview && (
+                <Box paddingBlockEnd="200">
+                  <img
+                    src={logoPreview}
+                    alt="Store logo preview"
+                    style={{ maxHeight: 80, maxWidth: 240, objectFit: "contain", border: "1px solid #e1e3e5", borderRadius: 4, padding: 4 }}
+                  />
+                </Box>
+              )}
+              <InlineStack gap="300" blockAlign="center">
+                <label style={{ cursor: "pointer" }}>
+                  <input
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                    style={{ display: "none" }}
+                    onChange={handleLogoFile}
+                  />
+                  <span
+                    style={{
+                      display: "inline-flex", alignItems: "center", padding: "6px 12px",
+                      border: "1px solid #8c9196", borderRadius: 4, cursor: "pointer",
+                      fontSize: 14, backgroundColor: "#fff",
+                    }}
+                  >
+                    {logoPreview ? "Change Logo" : "Choose File"}
+                  </span>
+                </label>
+                {logoPreview && (
+                  <>
+                    <Button
+                      variant="primary"
+                      onClick={handleSaveLogo}
+                      loading={isSubmitting && pendingIntent === "save_logo"}
+                      disabled={isSubmitting}
+                    >
+                      Save Logo
+                    </Button>
+                    <Button
+                      tone="critical"
+                      onClick={handleRemoveLogo}
+                      loading={isSubmitting && pendingIntent === "remove_logo"}
+                      disabled={isSubmitting}
+                    >
+                      Remove
+                    </Button>
+                  </>
+                )}
+              </InlineStack>
+            </BlockStack>
+          </Card>
+        )}
+
         {/* ── Default Booking Settings Card ──────────────────────────────── */}
         {hasCredentials && (
           <Card>
@@ -457,6 +587,24 @@ export default function Settings() {
                 onChange={setDefaultCostCenterCode}
                 helpText={costCenterPreview}
               />
+              <FormLayout.Group>
+                <TextField
+                  label="Shipper Phone (for label)"
+                  value={shipperPhone}
+                  onChange={setShipperPhone}
+                  autoComplete="off"
+                  placeholder="e.g. +923001234567"
+                  helpText="Your contact number shown on shipping labels"
+                />
+                <TextField
+                  label="Pickup Address (for label)"
+                  value={shipperAddress}
+                  onChange={setShipperAddress}
+                  autoComplete="off"
+                  placeholder="e.g. Shop 12, Main Blvd, Hyderabad"
+                  helpText="Your address shown on shipping labels. TCS may not provide this — enter manually if empty."
+                />
+              </FormLayout.Group>
               <TextField
                 label="Default Booking Instructions"
                 value={defaultInstructions}
