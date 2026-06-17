@@ -209,6 +209,8 @@ export const action = async ({ request }) => {
         await db.order
           .update({ where: { id: order.id }, data: { shopifyFulfillmentId: fb.fulfillmentId } })
           .catch((err) => console.error("[Bulk] fulfillmentId save failed:", err.message));
+      } else if (fb.skipped) {
+        console.log(`[Bulk] Shopify fulfillment skipped for ${order.name} (already fulfilled)`);
       } else if (fb.error) {
         console.warn(`[Bulk] Shopify fulfillment failed for ${order.name}:`, fb.error);
       }
@@ -258,7 +260,10 @@ export const action = async ({ request }) => {
     try {
       const fb = await fulfillShopifyOrder(admin, order, consignmentNo);
       shopifyFulfillmentId = fb.fulfillmentId;
-      if (fb.error) {
+      if (fb.skipped) {
+        // Order already fulfilled in Shopify — nothing to do, not an error
+        console.log("[Shopify] Fulfillment write-back skipped (order already fulfilled):", order.name);
+      } else if (fb.error) {
         fulfillmentError = fb.error;
         console.warn("[Shopify] Fulfillment write-back failed:", fb.error);
       }

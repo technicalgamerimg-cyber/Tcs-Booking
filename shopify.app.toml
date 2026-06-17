@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "e96dd6f2b07b59eaa0c33cb3ee9dc6de"
-application_url = "https://example.com"
+application_url = "https://tcs-booking.vercel.app"
 embedded = true
 name = "TCS BOOKING"
 
@@ -57,7 +57,10 @@ api_version = "2026-07"
   topics = [ "orders/cancelled" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [
+  "https://tcs-booking.vercel.app/auth/callback",
+  "https://tcs-booking.vercel.app/auth/shopify/callback"
+]
 
 [build]
 include_config_on_deploy = true

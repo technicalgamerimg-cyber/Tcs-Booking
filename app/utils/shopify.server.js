@@ -1,7 +1,7 @@
 const GET_FULFILLMENT_ORDERS = `#graphql
   query GetFulfillmentOrders($orderId: ID!) {
     order(id: $orderId) {
-      fulfillmentOrders(first: 5) {
+      fulfillmentOrders(first: 20) {
         nodes { id status assignedLocation { location { id } } }
       }
     }
@@ -47,8 +47,13 @@ export async function fulfillShopifyOrder(admin, order, consignmentNo) {
     const openFO = fulfillmentOrders.find((fo) => fo.status === 'OPEN');
 
     if (!openFO) {
-      const statuses = fulfillmentOrders.map((fo) => fo.status).join(', ') || 'none';
-      return { fulfillmentId: null, error: `No open fulfillment order (found: ${statuses})` };
+      const statuses = fulfillmentOrders.map((fo) => fo.status);
+      const allClosed = statuses.length > 0 && statuses.every((s) => s === 'CLOSED');
+      if (allClosed) {
+        // Order already fulfilled externally — skip silently, not a write-back error
+        return { fulfillmentId: null, error: null, skipped: true };
+      }
+      return { fulfillmentId: null, error: `No open fulfillment order (found: ${statuses.join(', ') || 'none'})` };
     }
 
     // Step 2: create fulfillment
