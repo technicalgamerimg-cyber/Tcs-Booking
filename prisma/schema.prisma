@@ -48,14 +48,18 @@ model Order {
   tcsConsignmentNo    String?
   shippingAddress1    String?
   productSummary      String?
-  bookedAt            DateTime?
+  bookedAt             DateTime?
   shopifyFulfillmentId String?
-  shipmentStatus      String    @default("BOOKED")
-  shopifyCreatedAt    DateTime?
-  createdAt           DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
+  shipmentStatus       String    @default("PENDING")
+  bookingInProgress    Boolean   @default(false)
+  shopifyCreatedAt     DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   @@index([shop])
+  @@index([shop, bookedAt])
+  @@index([shop, isCancelled])
+  @@index([shop, shipmentStatus])
 }
 
 model TcsSettings {
@@ -119,4 +123,16 @@ model TcsCostCenter {
 
   @@unique([shop, costCenterCode])
   @@index([shop])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  shop      String
+  orderId   String?
+  action    String
+  details   String?
+  createdAt DateTime @default(now())
+
+  @@index([shop, createdAt])
+  @@index([shop, orderId])
 }

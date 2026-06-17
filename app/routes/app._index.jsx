@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
-import { useLoaderData, useFetcher, useRouteError, useRevalidator } from "react-router";
+import { useLoaderData, useFetcher, useRouteError, useRevalidator, useNavigate } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import {
@@ -23,7 +23,7 @@ import {
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import { normalizePaymentStatus } from "../utils/orderStatus";
-import { bookTcsShipment, bookTcsShipmentBulk, runInBatches } from "../utils/tcs.server.js";
+import { bookTcsShipment, bookTcsShipmentBulk, runInBatches, getDefaultCostCenterDetails } from "../utils/tcs.server.js";
 import { fulfillShopifyOrder } from "../utils/shopify.server.js";
 
 const PAGE_SIZE = 50;
@@ -78,59 +78,61 @@ export const loader = async ({ request }) => {
 
     const edges = json.data?.orders?.edges ?? [];
 
-    for (const { node } of edges) {
-      const numericId = node.id.replace("gid://shopify/Order/", "");
-      const lineItems = node.lineItems?.edges?.map((e) => e.node) ?? [];
-      const productSummary = lineItems.length
-        ? lineItems
-            .map((item) => {
-              const sku = item.sku ? `[${item.sku}] ` : "";
-              return `${sku}${item.title} x${item.quantity}`;
-            })
-            .join(", ")
-            .slice(0, 500)
-        : null;
+    await Promise.allSettled(
+      edges.map(async ({ node }) => {
+        const numericId = node.id.replace("gid://shopify/Order/", "");
+        const lineItems = node.lineItems?.edges?.map((e) => e.node) ?? [];
+        const productSummary = lineItems.length
+          ? lineItems
+              .map((item) => {
+                const sku = item.sku ? `[${item.sku}] ` : "";
+                return `${sku}${item.title} x${item.quantity}`;
+              })
+              .join(", ")
+              .slice(0, 500)
+          : null;
 
-      await db.order.upsert({
-        where: { shopifyNumericId: numericId },
-        create: {
-          id: node.id,
-          shopifyNumericId: numericId,
-          shop,
-          name: node.name,
-          customerFirstName: node.customer?.firstName ?? null,
-          customerLastName: node.customer?.lastName ?? null,
-          customerPhone: node.customer?.phone ?? null,
-          totalAmount: node.totalPriceSet?.shopMoney?.amount ?? "0",
-          currencyCode: node.totalPriceSet?.shopMoney?.currencyCode ?? "",
-          city: node.shippingAddress?.city ?? null,
-          shippingAddress1: node.shippingAddress?.address1 ?? null,
-          financialStatus: normalizePaymentStatus(node.displayFinancialStatus),
-          fulfillmentStatus: node.displayFulfillmentStatus ?? null,
-          shopifyCreatedAt: node.createdAt ? new Date(node.createdAt) : null,
-          productSummary,
-          ...(node.displayFulfillmentStatus?.toUpperCase() === "FULFILLED"
-            ? { isBooked: true }
-            : {}),
-        },
-        update: {
-          name: node.name,
-          customerFirstName: node.customer?.firstName ?? null,
-          customerLastName: node.customer?.lastName ?? null,
-          customerPhone: node.customer?.phone ?? null,
-          totalAmount: node.totalPriceSet?.shopMoney?.amount ?? "0",
-          currencyCode: node.totalPriceSet?.shopMoney?.currencyCode ?? "",
-          city: node.shippingAddress?.city ?? null,
-          shippingAddress1: node.shippingAddress?.address1 ?? null,
-          financialStatus: normalizePaymentStatus(node.displayFinancialStatus),
-          fulfillmentStatus: node.displayFulfillmentStatus ?? null,
-          productSummary,
-          ...(node.displayFulfillmentStatus?.toUpperCase() === "FULFILLED"
-            ? { isBooked: true }
-            : {}),
-        },
-      });
-    }
+        await db.order.upsert({
+          where: { shopifyNumericId: numericId },
+          create: {
+            id: node.id,
+            shopifyNumericId: numericId,
+            shop,
+            name: node.name,
+            customerFirstName: node.customer?.firstName ?? null,
+            customerLastName: node.customer?.lastName ?? null,
+            customerPhone: node.customer?.phone ?? null,
+            totalAmount: node.totalPriceSet?.shopMoney?.amount ?? "0",
+            currencyCode: node.totalPriceSet?.shopMoney?.currencyCode ?? "",
+            city: node.shippingAddress?.city ?? null,
+            shippingAddress1: node.shippingAddress?.address1 ?? null,
+            financialStatus: normalizePaymentStatus(node.displayFinancialStatus),
+            fulfillmentStatus: node.displayFulfillmentStatus ?? null,
+            shopifyCreatedAt: node.createdAt ? new Date(node.createdAt) : null,
+            productSummary,
+            ...(node.displayFulfillmentStatus?.toUpperCase() === "FULFILLED"
+              ? { isBooked: true }
+              : {}),
+          },
+          update: {
+            name: node.name,
+            customerFirstName: node.customer?.firstName ?? null,
+            customerLastName: node.customer?.lastName ?? null,
+            customerPhone: node.customer?.phone ?? null,
+            totalAmount: node.totalPriceSet?.shopMoney?.amount ?? "0",
+            currencyCode: node.totalPriceSet?.shopMoney?.currencyCode ?? "",
+            city: node.shippingAddress?.city ?? null,
+            shippingAddress1: node.shippingAddress?.address1 ?? null,
+            financialStatus: normalizePaymentStatus(node.displayFinancialStatus),
+            fulfillmentStatus: node.displayFulfillmentStatus ?? null,
+            productSummary,
+            ...(node.displayFulfillmentStatus?.toUpperCase() === "FULFILLED"
+              ? { isBooked: true }
+              : {}),
+          },
+        });
+      }),
+    );
   } catch (err) {
     const msg =
       err?.graphQLErrors?.map((e) => e.message).join(", ") ??
@@ -141,7 +143,7 @@ export const loader = async ({ request }) => {
   }
 
   const skip = (page - 1) * PAGE_SIZE;
-  const [orders, total] = await Promise.all([
+  const [orders, total, costCenter, settingsRow] = await Promise.all([
     db.order.findMany({
       where: { shop, isCancelled: false },
       orderBy: { shopifyCreatedAt: "desc" },
@@ -149,7 +151,29 @@ export const loader = async ({ request }) => {
       skip,
     }),
     db.order.count({ where: { shop, isCancelled: false } }),
+    getDefaultCostCenterDetails(shop),
+    db.tcsSettings.findUnique({ where: { shop }, select: { storeLogo: true } }),
   ]);
+
+  let shipperCityCode = "";
+  if (costCenter?.costCenterCity) {
+    const row = await db.tcsCity.findFirst({
+      where: { shop, cityName: costCenter.costCenterCity },
+      select: { cityCode: true },
+    });
+    shipperCityCode = row?.cityCode || "";
+  }
+
+  const destCityNames = [...new Set(orders.map((o) => o.city).filter(Boolean))];
+  const cityCodes = destCityNames.length
+    ? await db.tcsCity.findMany({
+        where: { shop, cityName: { in: destCityNames } },
+        select: { cityName: true, cityCode: true },
+      })
+    : [];
+  const cityCodeMap = Object.fromEntries(
+    cityCodes.map((c) => [c.cityName.toLowerCase(), c.cityCode]),
+  );
 
   return {
     orders,
@@ -157,6 +181,10 @@ export const loader = async ({ request }) => {
     page,
     hasMore: skip + orders.length < total,
     syncError,
+    costCenter: costCenter ?? null,
+    shipperCityCode,
+    cityCodeMap,
+    storeLogo: settingsRow?.storeLogo ?? null,
   };
 };
 
@@ -312,10 +340,11 @@ export const action = async ({ request }) => {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Orders() {
-  const { orders, total, page, hasMore, syncError } = useLoaderData();
+  const { orders, total, page, hasMore, syncError, costCenter, shipperCityCode, cityCodeMap, storeLogo } = useLoaderData();
   const fetcher = useFetcher();
   const shopify = useAppBridge();
   const revalidator = useRevalidator();
+  const navigate = useNavigate();
 
   const [search, setSearch] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
@@ -407,6 +436,22 @@ export default function Orders() {
     setModalOpen(false);
     setSelectedOrder(null);
   }, []);
+
+  const openLabelForOrder = useCallback(
+    async (order) => {
+      if (!costCenter) {
+        shopify.toast.show("No cost center configured.", { isError: true });
+        return;
+      }
+      try {
+        const { openTcsLabel } = await import("../components/label/openTcsLabel.client.js");
+        await openTcsLabel([order], costCenter, { shipperCityCode, cityCodeMap, storeLogo });
+      } catch (err) {
+        shopify.toast.show(err.message || "Label failed.", { isError: true });
+      }
+    },
+    [costCenter, shipperCityCode, cityCodeMap, storeLogo, shopify],
+  );
 
   const handleQuickBook = useCallback(
     (order) => {
@@ -636,13 +681,9 @@ export default function Orders() {
                 <InlineStack align="center">
                   <Pagination
                     hasPrevious={page > 1}
-                    onPrevious={() => {
-                      window.location.href = `/app?page=${page - 1}`;
-                    }}
+                    onPrevious={() => navigate(`/app?page=${page - 1}`)}
                     hasNext={hasMore}
-                    onNext={() => {
-                      window.location.href = `/app?page=${page + 1}`;
-                    }}
+                    onNext={() => navigate(`/app?page=${page + 1}`)}
                     label={`Page ${page} of ${Math.ceil(total / PAGE_SIZE)}`}
                   />
                 </InlineStack>

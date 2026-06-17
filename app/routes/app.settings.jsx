@@ -162,6 +162,9 @@ export const action = async ({ request }) => {
     if (!logoData.startsWith("data:image/")) {
       return { success: false, error: "Invalid image format.", intent };
     }
+    if (logoData.length > 500_000) {
+      return { success: false, error: "Image too large. Max ~375 KB.", intent };
+    }
     try {
       await saveStoreLogo(shop, logoData);
       return { success: true, message: "Store logo saved.", intent };

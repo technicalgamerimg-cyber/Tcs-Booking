@@ -5,6 +5,22 @@ const TCS_AUTH_URL =
 const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 minutes before expiry
 const REQUEST_TIMEOUT_MS = 10_000; // 10 seconds
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function writeAudit(shop, action, orderId, details) {
+  db.auditLog
+    .create({ data: { shop, orderId: orderId ?? null, action, details: JSON.stringify(details) } })
+    .catch((err) => console.error("[Audit]", err.message));
+}
+
 // Normalise ALL-CAPS city/center names from TCS → "Title Case"
 function toTitleCase(str) {
   return str
@@ -82,17 +98,17 @@ export async function saveStoreLogo(shop, base64DataUrl) {
  * @param {{ bearerToken: string, username: string, password: string }} inputs
  */
 export function validateTcsInputs({ bearerToken, username, password, tcsAccount }) {
-  if (!bearerToken || bearerToken.trim().length < 10) {
-    throw new Error("Bearer Token is required and must be at least 10 characters.");
+  if (bearerToken && bearerToken.trim().length < 10) {
+    throw new Error("Bearer Token must be at least 10 characters.");
   }
-  if (!username || username.trim().length < 2) {
-    throw new Error("Username is required and must be at least 2 characters.");
+  if (username && username.trim().length < 2) {
+    throw new Error("Username must be at least 2 characters.");
   }
-  if (!password || password.trim().length < 4) {
-    throw new Error("Password is required and must be at least 4 characters.");
+  if (password && password.trim().length < 4) {
+    throw new Error("Password must be at least 4 characters.");
   }
-  if (!tcsAccount || tcsAccount.trim().length < 2) {
-    throw new Error("TCS Account Number is required and must be at least 2 characters.");
+  if (tcsAccount && tcsAccount.trim().length < 2) {
+    throw new Error("TCS Account Number must be at least 2 characters.");
   }
 }
 
@@ -104,27 +120,32 @@ export function validateTcsInputs({ bearerToken, username, password, tcsAccount 
  * @param {{ bearerToken: string, username: string, password: string }} credentials
  */
 export async function saveTcsCredentials(shop, { bearerToken, username, password, tcsAccount }) {
-  if (!bearerToken || !username || !password) {
-    throw new Error("All credential fields (bearerToken, username, password) are required.");
+  const existing = await db.tcsSettings.findUnique({
+    where: { shop },
+    select: { bearerToken: true, username: true, password: true, tcsAccount: true },
+  });
+
+  const merged = {
+    bearerToken: bearerToken?.trim() || existing?.bearerToken || "",
+    username:    username?.trim()    || existing?.username    || "",
+    password:    password?.trim()    || existing?.password    || "",
+    tcsAccount:  tcsAccount?.trim()  || existing?.tcsAccount  || "",
+  };
+
+  if (!existing && (!merged.bearerToken || !merged.username || !merged.password)) {
+    throw new Error("All credential fields are required for first-time setup.");
   }
 
   await db.tcsSettings.upsert({
     where: { shop },
     create: {
       shop,
-      bearerToken: bearerToken.trim(),
-      username: username.trim(),
-      password: password.trim(),
-      tcsAccount: tcsAccount ? tcsAccount.trim() : "",
+      ...merged,
       connectionStatus: "disconnected",
     },
     update: {
-      bearerToken: bearerToken.trim(),
-      username: username.trim(),
-      password: password.trim(),
-      tcsAccount: tcsAccount ? tcsAccount.trim() : undefined,
+      ...merged,
       connectionStatus: "disconnected",
-      // Clear any stale auth state when credentials change
       accessToken: null,
       accessTokenExpiry: null,
       lastApiMessage: null,
@@ -206,6 +227,15 @@ export async function bookTcsShipment(shop, order, { bookingWeight, bookingInstr
   if (!order.customerPhone) throw new Error(`Order ${order.name} has no customer phone. Cannot book.`);
   if (!order.city) throw new Error(`Order ${order.name} has no city. Cannot book.`);
 
+  // Atomic claim: only succeeds if not already booked and not in progress
+  const claim = await db.order.updateMany({
+    where: { id: order.id, isBooked: false, bookingInProgress: false },
+    data: { bookingInProgress: true },
+  });
+  if (claim.count === 0) {
+    throw new Error("This order is already being booked or has been booked. Please refresh.");
+  }
+
   const weightKg = Math.max(parseFloat(bookingWeight) || 0.5, 0.5);
   const isPaid = order.financialStatus?.toLowerCase() === "paid";
   const codAmount = isPaid ? 0 : (parseInt(bookingFreeCod || order.totalAmount, 10) || 0);
@@ -244,46 +274,56 @@ export async function bookTcsShipment(shop, order, { bookingWeight, bookingInstr
     },
   };
 
-  const res = await fetch("https://ociconnect.tcscourier.com/ecom/api/booking/create", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${settings.bearerToken}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const body = await res.json().catch(() => ({}));
-
-  // Defensive: try all known response field names from TCS
-  const consignmentNo =
-    body.consignmentNo ||
-    body.data?.consignmentNo ||
-    body.data?.consignmentnumber ||
-    body.consignmentnumber ||
-    null;
-
-  if (!res.ok || body.status === false || !consignmentNo) {
-    throw new Error(body.message || body.data?.message || `TCS booking failed (HTTP ${res.status})`);
-  }
-
-  // Separate try/catch: TCS shipment was created — log CN if DB write fails
+  let consignmentNo = null;
   try {
-    await db.order.update({
-      where: { id: order.id },
-      data: {
-        isBooked: true,
-        tcsConsignmentNo: consignmentNo,
-        bookingWeight: String(weightKg),
-        bookingInstructions: remarks || null,
-        bookingFreeCod: String(codAmount),
-        bookedAt: new Date(),
-        shipmentStatus: 'BOOKED',
+    const res = await fetchWithTimeout("https://ociconnect.tcscourier.com/ecom/api/booking/create", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${settings.bearerToken}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
       },
+      body: JSON.stringify(payload),
     });
-  } catch (dbErr) {
-    console.error(`[TCS] DB update failed after booking. CN: ${consignmentNo} | Order: ${order.name}`, dbErr.message);
+
+    const body = await res.json().catch(() => ({}));
+
+    consignmentNo =
+      body.consignmentNo ||
+      body.data?.consignmentNo ||
+      body.data?.consignmentnumber ||
+      body.consignmentnumber ||
+      null;
+
+    if (!res.ok || body.status === false || !consignmentNo) {
+      throw new Error(body.message || body.data?.message || `TCS booking failed (HTTP ${res.status})`);
+    }
+
+    try {
+      await db.order.update({
+        where: { id: order.id },
+        data: {
+          isBooked: true,
+          tcsConsignmentNo: consignmentNo,
+          bookingWeight: String(weightKg),
+          bookingInstructions: remarks || null,
+          bookingFreeCod: String(codAmount),
+          bookedAt: new Date(),
+          shipmentStatus: "BOOKED",
+          bookingInProgress: false,
+        },
+      });
+      writeAudit(shop, "BOOKED", order.id, { consignmentNo, weightKg, codAmount });
+    } catch (dbErr) {
+      console.error(`[TCS] DB update failed after booking. CN: ${consignmentNo} | Order: ${order.name}`, dbErr.message);
+    }
+  } catch (err) {
+    // Release the lock so the user can retry
+    await db.order.updateMany({
+      where: { id: order.id },
+      data: { bookingInProgress: false },
+    }).catch(() => {});
+    throw err;
   }
 
   return { consignmentNo, remarks };
@@ -312,7 +352,7 @@ export async function getTcsLabel(shop, consignmentNo) {
   url.searchParams.set("printtype", "1");
   url.searchParams.set("accounttype", "1");
 
-  const res = await fetch(url.toString(), {
+  const res = await fetchWithTimeout(url.toString(), {
     headers: { Authorization: `Bearer ${settings.bearerToken}` },
   });
 
@@ -370,7 +410,7 @@ export async function cancelTcsShipment(shop, consignmentNo) {
     db.tcsSettings.findUnique({ where: { shop }, select: { bearerToken: true } }),
   ]);
 
-  const res = await fetch('https://ociconnect.tcscourier.com/ecom/api/booking/cancel', {
+  const res = await fetchWithTimeout('https://ociconnect.tcscourier.com/ecom/api/booking/cancel', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${settings.bearerToken}`,
@@ -427,7 +467,7 @@ export async function syncTcsData(shop, tcsAccount) {
   const { bearerToken } = settings;
 
   // 1. Fetch Cities
-  const citiesRes = await fetch(
+  const citiesRes = await fetchWithTimeout(
     `https://ociconnect.tcscourier.com/ecom/api/setup/citylistbycountry?countrycode=Pk&accesstoken=${encodeURIComponent(accessToken)}`,
     {
       method: "GET",
@@ -454,7 +494,7 @@ export async function syncTcsData(shop, tcsAccount) {
     // Transaction: delete + insert are atomic — partial state impossible
     await db.$transaction(async (tx) => {
       await tx.tcsCity.deleteMany({ where: { shop } });
-      // SQLite has a variable limit; insert in chunks of 500
+      // Insert in chunks of 500 to avoid hitting PostgreSQL parameter limits on large city lists
       for (let i = 0; i < uniqueCities.length; i += 500) {
         await tx.tcsCity.createMany({ data: uniqueCities.slice(i, i + 500) });
       }
@@ -463,7 +503,7 @@ export async function syncTcsData(shop, tcsAccount) {
   }
 
   // 2. Fetch Cost Centers
-  const ccRes = await fetch(
+  const ccRes = await fetchWithTimeout(
     `https://ociconnect.tcscourier.com/ecom/api/inquiry/costcenterinquiry?accesstoken=${encodeURIComponent(accessToken)}&customerno=${encodeURIComponent(tcsAccount)}`,
     {
       method: "GET",
@@ -535,25 +575,21 @@ export async function authenticateTcs(shop) {
   let accessTokenExpiry = null;
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const authUrl = new URL(TCS_AUTH_URL);
+    authUrl.searchParams.set("username", record.username);
+    authUrl.searchParams.set("password", record.password);
 
     let response;
     try {
-      const url = new URL(TCS_AUTH_URL);
-      url.searchParams.set("username", record.username);
-      url.searchParams.set("password", record.password);
-
-      response = await fetch(url.toString(), {
+      response = await fetchWithTimeout(authUrl.toString(), {
         method: "GET",
         headers: {
           Authorization: `Bearer ${record.bearerToken}`,
           Accept: "application/json",
         },
-        signal: controller.signal,
       });
-    } finally {
-      clearTimeout(timeout);
+    } catch (fetchErr) {
+      throw fetchErr;
     }
 
     if (!response.ok) {
