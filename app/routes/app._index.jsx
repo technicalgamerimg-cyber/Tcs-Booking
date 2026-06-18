@@ -426,7 +426,7 @@ export const action = async ({ request }) => {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-function SetupGuide({ onboarding }) {
+function SetupGuide({ onboarding, onNavigate }) {
   const progress = onboarding.total
     ? Math.round((onboarding.completed / onboarding.total) * 100)
     : 0;
@@ -474,7 +474,7 @@ function SetupGuide({ onboarding }) {
                   </BlockStack>
                 </InlineStack>
                 {!step.complete && (
-                  <Button url={step.url} size="slim">
+                  <Button onClick={() => onNavigate(step.url)} size="slim">
                     {step.action}
                   </Button>
                 )}
@@ -487,7 +487,7 @@ function SetupGuide({ onboarding }) {
   );
 }
 
-function ReadySummary({ onboarding, total }) {
+function ReadySummary({ onboarding, total, onNavigate }) {
   return (
     <Card>
       <BlockStack gap="300">
@@ -538,11 +538,11 @@ function ReadySummary({ onboarding, total }) {
           </BlockStack>
         </InlineStack>
         <InlineStack gap="300">
-          <Button variant="primary" url="/app">
+          <Button variant="primary" onClick={() => onNavigate("/app")}>
             Book orders
           </Button>
-          <Button url="/app/shipments">View shipments</Button>
-          <Button url="/app/settings">Settings</Button>
+          <Button onClick={() => onNavigate("/app/shipments")}>View shipments</Button>
+          <Button onClick={() => onNavigate("/app/settings")}>Settings</Button>
         </InlineStack>
       </BlockStack>
     </Card>
@@ -795,9 +795,13 @@ export default function Orders() {
     <Page title="Orders" subtitle={`${total} total`}>
       <BlockStack gap="400">
         {onboarding.complete ? (
-          <ReadySummary onboarding={onboarding} total={total} />
+          <ReadySummary
+            onboarding={onboarding}
+            total={total}
+            onNavigate={navigate}
+          />
         ) : (
-          <SetupGuide onboarding={onboarding} />
+          <SetupGuide onboarding={onboarding} onNavigate={navigate} />
         )}
 
         {syncError && (
