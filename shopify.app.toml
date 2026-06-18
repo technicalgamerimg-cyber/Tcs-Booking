@@ -33,16 +33,8 @@ api_version = "2026-07"
   topics = [ "orders/cancelled" ]
 
   [[webhooks.subscriptions]]
-  uri = "/webhooks/customers/data_request"
-  topics = [ "customers/data_request" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/customers/redact"
-  topics = [ "customers/redact" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/shop/redact"
-  topics = [ "shop/redact" ]
+  uri = "/webhooks/privacy"
+  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
 
 [auth]
 redirect_urls = [
