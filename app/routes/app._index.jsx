@@ -234,7 +234,12 @@ export const action = async ({ request }) => {
       )
       .filter(Boolean);
 
+    const BLOCKED_STATUSES = ["voided", "refunded", "partially_refunded"];
     await runInBatches(bookedPairs, 3, async ({ order, consignmentNo }) => {
+      if (BLOCKED_STATUSES.includes(order.financialStatus?.toLowerCase())) {
+        console.log(`[Bulk] Fulfillment skipped for ${order.name} (${order.financialStatus})`);
+        return;
+      }
       const fb = await fulfillShopifyOrder(admin, order, consignmentNo);
       if (fb.fulfillmentId) {
         await db.order
@@ -288,19 +293,25 @@ export const action = async ({ request }) => {
     // Shopify fulfillment write-back (non-blocking — booking still succeeds if this fails)
     let shopifyFulfillmentId = null;
     let fulfillmentError = null;
-    try {
-      const fb = await fulfillShopifyOrder(admin, order, consignmentNo);
-      shopifyFulfillmentId = fb.fulfillmentId;
-      if (fb.skipped) {
-        // Order already fulfilled in Shopify — nothing to do, not an error
-        console.log("[Shopify] Fulfillment write-back skipped (order already fulfilled):", order.name);
-      } else if (fb.error) {
-        fulfillmentError = fb.error;
-        console.warn("[Shopify] Fulfillment write-back failed:", fb.error);
+    const paymentBlocked = ["voided", "refunded", "partially_refunded"].includes(
+      order.financialStatus?.toLowerCase(),
+    );
+    if (paymentBlocked) {
+      console.log(`[Shopify] Fulfillment skipped for ${order.name} (${order.financialStatus})`);
+    } else {
+      try {
+        const fb = await fulfillShopifyOrder(admin, order, consignmentNo);
+        shopifyFulfillmentId = fb.fulfillmentId;
+        if (fb.skipped) {
+          console.log("[Shopify] Fulfillment write-back skipped (order already fulfilled):", order.name);
+        } else if (fb.error) {
+          fulfillmentError = fb.error;
+          console.warn("[Shopify] Fulfillment write-back failed:", fb.error);
+        }
+      } catch (fbErr) {
+        fulfillmentError = fbErr.message;
+        console.error("[Shopify] Fulfillment write-back threw:", fbErr.message);
       }
-    } catch (fbErr) {
-      fulfillmentError = fbErr.message;
-      console.error("[Shopify] Fulfillment write-back threw:", fbErr.message);
     }
 
     if (shopifyFulfillmentId) {

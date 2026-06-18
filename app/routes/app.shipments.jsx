@@ -277,12 +277,19 @@ export const action = async ({ request }) => {
 
       // Shopify fulfillment write-back
       let shopifyFulfillmentId = null;
-      try {
-        const fb = await fulfillShopifyOrder(admin, order, consignmentNo);
-        shopifyFulfillmentId = fb.fulfillmentId;
-        if (fb.error) console.warn("[Rebook] Shopify fulfillment failed:", fb.error);
-      } catch (fbErr) {
-        console.error("[Rebook] Shopify write-back threw:", fbErr.message);
+      const paymentBlocked = ["voided", "refunded", "partially_refunded"].includes(
+        order.financialStatus?.toLowerCase(),
+      );
+      if (paymentBlocked) {
+        console.log(`[Rebook] Fulfillment skipped for ${order.name} (${order.financialStatus})`);
+      } else {
+        try {
+          const fb = await fulfillShopifyOrder(admin, order, consignmentNo);
+          shopifyFulfillmentId = fb.fulfillmentId;
+          if (fb.error) console.warn("[Rebook] Shopify fulfillment failed:", fb.error);
+        } catch (fbErr) {
+          console.error("[Rebook] Shopify write-back threw:", fbErr.message);
+        }
       }
 
       if (shopifyFulfillmentId) {
