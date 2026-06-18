@@ -2,7 +2,7 @@ const GET_FULFILLMENT_ORDERS = `#graphql
   query GetFulfillmentOrders($orderId: ID!) {
     order(id: $orderId) {
       fulfillmentOrders(first: 20) {
-        nodes { id status assignedLocation { location { id } } }
+        nodes { id status }
       }
     }
   }

@@ -7,6 +7,12 @@ This document explains why each API scope is requested by the TCS Booking app.
 **Why:** The Orders page fetches the merchant's orders via the Admin GraphQL API to display
 them for TCS booking. Without this scope the orders list cannot be loaded.
 
+## read_customers
+**Used in:** `app/routes/app._index.jsx` - `FetchOrders` GraphQL query
+**Why:** The app reads the customer's name and phone from each order so merchants can book
+TCS shipments with required consignee details. Without this scope Shopify denies access to
+the `customer` field in the Admin GraphQL order query.
+
 ## write_orders
 **Used in:** `app/utils/shopify.server.js` — `fulfillmentCreateV2` mutation (side effect)  
 **Why:** When a TCS shipment is booked, the app creates a Shopify fulfillment with tracking

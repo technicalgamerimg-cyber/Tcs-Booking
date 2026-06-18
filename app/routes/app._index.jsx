@@ -19,6 +19,8 @@ import {
   Banner,
   List,
   Pagination,
+  ProgressBar,
+  Divider,
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -146,7 +148,15 @@ export const loader = async ({ request }) => {
   }
 
   const skip = (page - 1) * PAGE_SIZE;
-  const [orders, total, costCenter, settingsRow] = await Promise.all([
+  const [
+    orders,
+    total,
+    costCenter,
+    settingsRow,
+    citiesCount,
+    costCentersCount,
+    bookedShipmentsCount,
+  ] = await Promise.all([
     db.order.findMany({
       where: { shop, isCancelled: false },
       orderBy: { shopifyCreatedAt: "desc" },
@@ -155,7 +165,23 @@ export const loader = async ({ request }) => {
     }),
     db.order.count({ where: { shop, isCancelled: false } }),
     getDefaultCostCenterDetails(shop),
-    db.tcsSettings.findUnique({ where: { shop }, select: { storeLogo: true } }),
+    db.tcsSettings.findUnique({
+      where: { shop },
+      select: {
+        storeLogo: true,
+        connectionStatus: true,
+        costCenterCode: true,
+        tcsAccount: true,
+      },
+    }),
+    db.tcsCity.count({ where: { shop } }),
+    db.tcsCostCenter.count({ where: { shop } }),
+    db.order.count({
+      where: {
+        shop,
+        OR: [{ isBooked: true }, { tcsConsignmentNo: { not: null } }],
+      },
+    }),
   ]);
 
   let shipperCityCode = "";
@@ -178,6 +204,43 @@ export const loader = async ({ request }) => {
     cityCodes.map((c) => [c.cityName.toLowerCase(), c.cityCode]),
   );
 
+  const setupSteps = [
+    {
+      id: "connect",
+      title: "Connect TCS credentials",
+      description: "Add your TCS API bearer token, username, password, and account number.",
+      complete: Boolean(settingsRow) && settingsRow.connectionStatus === "connected",
+      action: "Open settings",
+      url: "/app/settings",
+    },
+    {
+      id: "sync",
+      title: "Sync cities and cost centers",
+      description: "Import the TCS city and cost center lists used when booking consignments.",
+      complete: citiesCount > 0 && costCentersCount > 0,
+      action: "Sync in settings",
+      url: "/app/settings",
+    },
+    {
+      id: "cost-center",
+      title: "Choose a default cost center",
+      description: "Pick the pickup/cost center and confirm shipper phone and address.",
+      complete: Boolean(settingsRow?.costCenterCode),
+      action: "Choose default",
+      url: "/app/settings",
+    },
+    {
+      id: "first-booking",
+      title: "Book your first shipment",
+      description: "Create a TCS consignment from a Shopify order and print the label.",
+      complete: bookedShipmentsCount > 0,
+      action: "View orders",
+      url: "/app",
+    },
+  ];
+
+  const completedSetupSteps = setupSteps.filter((step) => step.complete).length;
+
   return {
     orders,
     total,
@@ -188,6 +251,16 @@ export const loader = async ({ request }) => {
     shipperCityCode,
     cityCodeMap,
     storeLogo: settingsRow?.storeLogo ?? null,
+    onboarding: {
+      steps: setupSteps,
+      completed: completedSetupSteps,
+      total: setupSteps.length,
+      complete: completedSetupSteps === setupSteps.length,
+      connectionStatus: settingsRow?.connectionStatus ?? "disconnected",
+      citiesCount,
+      costCentersCount,
+      bookedShipmentsCount,
+    },
   };
 };
 
@@ -353,8 +426,142 @@ export const action = async ({ request }) => {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
+function SetupGuide({ onboarding }) {
+  const progress = onboarding.total
+    ? Math.round((onboarding.completed / onboarding.total) * 100)
+    : 0;
+
+  return (
+    <Card>
+      <BlockStack gap="400">
+        <BlockStack gap="200">
+          <InlineStack align="space-between" blockAlign="center">
+            <Text variant="headingMd" as="h2">
+              Setup guide
+            </Text>
+            <Badge tone={onboarding.complete ? "success" : "attention"}>
+              {onboarding.completed} of {onboarding.total} complete
+            </Badge>
+          </InlineStack>
+          <Text tone="subdued" as="p">
+            Connect TCS, sync your account data, and book your first shipment.
+          </Text>
+          <ProgressBar progress={progress} size="small" tone="primary" />
+        </BlockStack>
+
+        <BlockStack gap="300">
+          {onboarding.steps.map((step, index) => (
+            <Box
+              key={step.id}
+              padding="400"
+              borderColor="border"
+              borderWidth="025"
+              borderRadius="200"
+              background={step.complete ? "bg-surface-success" : "bg-surface"}
+            >
+              <InlineStack align="space-between" blockAlign="start" gap="400">
+                <InlineStack gap="300" blockAlign="start" wrap={false}>
+                  <Badge tone={step.complete ? "success" : undefined}>
+                    {step.complete ? "Done" : `Step ${index + 1}`}
+                  </Badge>
+                  <BlockStack gap="100">
+                    <Text variant="bodyMd" fontWeight="semibold" as="p">
+                      {step.title}
+                    </Text>
+                    <Text tone="subdued" as="p">
+                      {step.description}
+                    </Text>
+                  </BlockStack>
+                </InlineStack>
+                {!step.complete && (
+                  <Button url={step.url} size="slim">
+                    {step.action}
+                  </Button>
+                )}
+              </InlineStack>
+            </Box>
+          ))}
+        </BlockStack>
+      </BlockStack>
+    </Card>
+  );
+}
+
+function ReadySummary({ onboarding, total }) {
+  return (
+    <Card>
+      <BlockStack gap="300">
+        <InlineStack align="space-between" blockAlign="center">
+          <BlockStack gap="100">
+            <Text variant="headingMd" as="h2">
+              TCS Booking is ready
+            </Text>
+            <Text tone="subdued" as="p">
+              Your TCS connection and default booking settings are configured.
+            </Text>
+          </BlockStack>
+          <Badge tone="success">Ready</Badge>
+        </InlineStack>
+        <Divider />
+        <InlineStack gap="600" wrap>
+          <BlockStack gap="100">
+            <Text tone="subdued" as="span">
+              Orders synced
+            </Text>
+            <Text variant="headingMd" as="span">
+              {total}
+            </Text>
+          </BlockStack>
+          <BlockStack gap="100">
+            <Text tone="subdued" as="span">
+              Cities
+            </Text>
+            <Text variant="headingMd" as="span">
+              {onboarding.citiesCount}
+            </Text>
+          </BlockStack>
+          <BlockStack gap="100">
+            <Text tone="subdued" as="span">
+              Cost centers
+            </Text>
+            <Text variant="headingMd" as="span">
+              {onboarding.costCentersCount}
+            </Text>
+          </BlockStack>
+          <BlockStack gap="100">
+            <Text tone="subdued" as="span">
+              Shipments booked
+            </Text>
+            <Text variant="headingMd" as="span">
+              {onboarding.bookedShipmentsCount}
+            </Text>
+          </BlockStack>
+        </InlineStack>
+        <InlineStack gap="300">
+          <Button variant="primary" url="/app">
+            Book orders
+          </Button>
+          <Button url="/app/shipments">View shipments</Button>
+          <Button url="/app/settings">Settings</Button>
+        </InlineStack>
+      </BlockStack>
+    </Card>
+  );
+}
+
 export default function Orders() {
-  const { orders, total, page, hasMore, syncError, costCenter, shipperCityCode, cityCodeMap, storeLogo } = useLoaderData();
+  const {
+    orders,
+    total,
+    page,
+    hasMore,
+    syncError,
+    costCenter,
+    shipperCityCode,
+    cityCodeMap,
+    storeLogo,
+    onboarding,
+  } = useLoaderData();
   const fetcher = useFetcher();
   const shopify = useAppBridge();
   const revalidator = useRevalidator();
@@ -587,6 +794,12 @@ export default function Orders() {
   return (
     <Page title="Orders" subtitle={`${total} total`}>
       <BlockStack gap="400">
+        {onboarding.complete ? (
+          <ReadySummary onboarding={onboarding} total={total} />
+        ) : (
+          <SetupGuide onboarding={onboarding} />
+        )}
+
         {syncError && (
           <Banner tone="critical" title="Sync error">
             <p>{syncError}</p>
