@@ -70,13 +70,16 @@ export const loader = async ({ request }) => {
     });
     const json = await response.json();
 
-    if (json.errors) {
+    if (json.errors?.some((e) => e.extensions?.code === "THROTTLED")) {
+      console.warn("[Shopify] API throttled — serving cached orders without sync");
+      syncError = "Shopify API is temporarily throttled. Showing cached orders.";
+    } else if (json.errors) {
       const msgs = json.errors.map((e) => e.message).join(", ");
       console.error("Orders GraphQL errors:", msgs);
       syncError = msgs;
     }
 
-    const edges = json.data?.orders?.edges ?? [];
+    const edges = syncError ? [] : (json.data?.orders?.edges ?? []);
 
     await Promise.allSettled(
       edges.map(async ({ node }) => {

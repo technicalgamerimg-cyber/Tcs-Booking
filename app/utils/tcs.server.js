@@ -15,6 +15,22 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_M
   }
 }
 
+async function fetchWithRetry(url, options = {}, { retries = 2, baseDelayMs = 500 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetchWithTimeout(url, options);
+      if (res.status < 500) return res;
+      if (attempt === retries) return res;
+    } catch (err) {
+      if (attempt === retries) throw err;
+      if (err.name !== "AbortError" && !err.message?.includes("network")) throw err;
+    }
+    await new Promise((r) =>
+      setTimeout(r, baseDelayMs * Math.pow(2, attempt) + Math.random() * 100),
+    );
+  }
+}
+
 function writeAudit(shop, action, orderId, details) {
   db.auditLog
     .create({ data: { shop, orderId: orderId ?? null, action, details: JSON.stringify(details) } })
@@ -276,7 +292,7 @@ export async function bookTcsShipment(shop, order, { bookingWeight, bookingInstr
 
   let consignmentNo = null;
   try {
-    const res = await fetchWithTimeout("https://ociconnect.tcscourier.com/ecom/api/booking/create", {
+    const res = await fetchWithRetry("https://ociconnect.tcscourier.com/ecom/api/booking/create", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${settings.bearerToken}`,
@@ -410,7 +426,7 @@ export async function cancelTcsShipment(shop, consignmentNo) {
     db.tcsSettings.findUnique({ where: { shop }, select: { bearerToken: true } }),
   ]);
 
-  const res = await fetchWithTimeout('https://ociconnect.tcscourier.com/ecom/api/booking/cancel', {
+  const res = await fetchWithRetry('https://ociconnect.tcscourier.com/ecom/api/booking/cancel', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${settings.bearerToken}`,
@@ -581,7 +597,7 @@ export async function authenticateTcs(shop) {
 
     let response;
     try {
-      response = await fetchWithTimeout(authUrl.toString(), {
+      response = await fetchWithRetry(authUrl.toString(), {
         method: "GET",
         headers: {
           Authorization: `Bearer ${record.bearerToken}`,
